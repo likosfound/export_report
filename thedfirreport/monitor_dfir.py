@@ -32,7 +32,7 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------- настройки
 FEED_URL = "https://thedfirreport.com/feed/"
 OUT_DIR  = Path("thedfirreport/dfir_reports")
-DB_PATH  = Path("seen_dfir.db")
+DB_PATH  = Path("thedfirreport/seen_dfir.db")
 
 # False - НЕ проверять TLS: корпоративный прокси/Zscaler подменяет сертификаты.
 VERIFY_SSL = False
