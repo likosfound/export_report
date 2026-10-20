@@ -2,7 +2,7 @@ name: dfir-monitor
 
 on:
   schedule:
-    - cron: '21 14 * * *' # ежедневно в 14:21 UTC = 17:21 по Москве
+    - cron: '20 8 * * *' # ежедневно в 08:20 UTC = 11:20 по Москве
   workflow_dispatch:
 
 permissions:
