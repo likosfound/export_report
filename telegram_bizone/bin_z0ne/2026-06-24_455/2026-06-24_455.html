@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>**🤔**** Рассказываем об инструменте для скрытой загрузки DLL в Windows и способах его обнаружения**</title>
+<style>
+  body { max-width: 860px; margin: 24px auto; padding: 0 16px;
+         font-family: Arial, sans-serif; line-height: 1.55; }
+  .meta { color: #666; font-size: 13px; }
+  p { overflow-wrap: anywhere; }
+  img { border: 1px solid #ddd; border-radius: 6px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>@bin_z0ne</h1>
+<p class="meta">Дата: 2026-06-24 08:53:10 UTC · ID: 455 ·
+<a href="https://web.telegram.org/a/#1123893738/455" target="_blank">открыть в вебе</a> ·
+<a href="https://t.me/bin_z0ne/455" target="_blank">t.me/455</a></p>
+<hr>
+<p>**🤔**** Рассказываем об инструменте для скрытой загрузки DLL в Windows и способах его обнаружения**</p>
+<p>Большинство средств защиты отслеживают загрузку DLL с помощью механизма функций обратного вызова (Kernel Notify Routines). Он уведомляет защитные решения о появлении нового модуля в памяти процесса и позволяет анализировать его поведение или перехватывать выполнение.</p>
+<p>DarkLoadLibrary позволяет обойти этот механизм. Вот как это выглядит:</p>
+<p>Вместо стандартной цепочки NtCreateSection → NtMapViewOfSection библиотека загружается в память через NtAllocateVirtualMemory. В результате LoadImageNotifyRoutine не вызывается, а средства защиты не получают телеметрию о загрузке модуля.</p>
+<p>В отличие от Reflective DLL Loading, эта техника позволяет загружать DLL непосредственно с диска, включая системные библиотеки. Благодаря этому вредоносное ПО может использовать штатные API Windows, не вызывая уведомлений о загрузке соответствующих модулей. Такой подход, например, реализован в C2-фреймворке NightHawk.</p>
+<p>При этом полностью скрыть такую активность невозможно. </p>
+<p>Если библиотека остается в системных списках, ее можно обнаружить по расположению в памяти процесса. Если же модуль отвязан от них, выявить использование DarkLoadLibrary помогают косвенные признаки, например анализ CallTrace в событиях доступа к памяти.</p>
+<p>Как работает DarkLoadLibrary и какие артефакты помогают обнаружить эту технику —** **[**разобрали в статье**](https://bi.zone/expertise/blog/skrytaya-ugroza-chem-opasen-darkloadlibrary-i-kak-vyyavit-ego-ispolzovanie-pri-atakakh/?utm_source=telegram&amp;utm_medium=post&amp;utm_campaign=skrytaya-ugroza-chem-opasen-darkloadlibrary-i-kak-vyyavit-ego-ispolzovanie-pri-atakakh&amp;utm_content=24.06.2026&amp;utm_term=bi.zone).</p>
+<p><img src="images/photo_2026-06-24_08-53-10.jpg" style="max-width:100%;height:auto;" loading="lazy"></p>
+</body>
+</html>
