@@ -29,6 +29,6 @@ jobs:
         run: |
           git config user.name "reports-bot"
           git config user.email "reports-bot@users.noreply.github.com"
-          git add thedfirreport/
+          git add thedfirreport/thedfirreport_articles thedfirreport/seen_dfir.db
           git diff --quiet && git diff --cached --quiet || git commit -m "update dfir reports"
           git push
