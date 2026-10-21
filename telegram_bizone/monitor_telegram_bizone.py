@@ -6,19 +6,19 @@
 Логика — по аналогии с DFIR:
   - проверяем последние 20 сообщений канала;
   - каждое НОВОЕ сообщение сохраняем в отдельную папку:
-        telegram/bin_z0ne/<дата>_<msg_id>/
+        telegram_bizone/bin_z0ne/<дата>_<msg_id>/
             <дата>_<msg_id>.html
             images/<файл.png|jpg|...>
-  - дедупликация по msg_id в SQLite (telegram/seen_binzone.db):
+  - дедупликация по msg_id в SQLite (telegram_bizone/seen_binzone.db):
     уже обработанные сообщения пропускаются, качаются только новые.
 
 Запуск:
-    python telegram/monitor_telegram_bizone.py
+    python telegram_bizone/monitor_telegram_bizone.py
 
 Переменные окружения (секреты GitHub):
     TG_API_ID           — целое число api_id
     TG_API_HASH         — строка api_hash
-    TG_SESSION_STRING   — сессия из tg_make_session_bizone.py
+    TG_SESSION_STRING   — session string (сгенерирована локально)
     TG_SCAN_LIMIT       — (опционально) сколько последних сообщений сканировать,
                           по умолчанию 20.
 """
@@ -35,15 +35,15 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ------------------------------------------------------- настройки
-CHANNEL = "bin_z0ne"                     # https://t.me/bin_z0ne
-OUT_DIR = Path("telegram/bin_z0ne")
-DB_PATH = Path("telegram/seen_binzone.db")
+CHANNEL = "bin_z0ne"                          # https://t.me/bin_z0ne
+OUT_DIR = Path("telegram_bizone/bin_z0ne")    # посты сохраняем рядом со скриптом
+DB_PATH = Path("telegram_bizone/seen_binzone.db")
 
 TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
 TG_SESSION = os.environ["TG_SESSION_STRING"]
 
-# сколько последних сообщений проверяем — по умолчанию 20 (как просил пользователь)
+# сколько последних сообщений проверяем — по умолчанию 20
 SCAN_LIMIT = int(os.environ.get("TG_SCAN_LIMIT", 20))
 if SCAN_LIMIT <= 0:
     SCAN_LIMIT = None   # 0 = неограниченно (вся история)
