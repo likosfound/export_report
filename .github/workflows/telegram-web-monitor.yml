@@ -1,20 +1,18 @@
-name: telegram-binzone-monitor
+name: telegram-binzone-web
 
 on:
   schedule:
-    - cron: '*/10 * * * *'     # каждые 10 минут
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  monitor:
+  capture:
     runs-on: ubuntu-latest
     env:
-      TG_API_ID: ${{ secrets.TG_API_ID }}
-      TG_API_HASH: ${{ secrets.TG_API_HASH }}
-      TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+      TG_WEB_STORAGE: ${{ secrets.TG_WEB_STORAGE }}
       TG_SCAN_LIMIT: 20
     steps:
       - uses: actions/checkout@v4
@@ -25,15 +23,17 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
-      - name: Run telegram monitor
-        run: python telegram_bizone/monitor_telegram_bizone.py   # ← правильный путь
+      - name: Run web capture
+        run: python telegram_bizone/monitor_tg_bizone.py
 
       - name: Commit and push results
         run: |
           git config user.name "reports-bot"
           git config user.email "reports-bot@users.noreply.github.com"
-          git add telegram_bizone/                              # ← и здесь тоже
+          git add telegram_bizone/
           git diff --quiet && git diff --cached --quiet || git commit -m "update telegram reports"
           git push
