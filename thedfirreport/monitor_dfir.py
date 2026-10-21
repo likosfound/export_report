@@ -1,67 +1,74 @@
 #!/usr/bin/env python3
 """
-Монитор аналитических отчётов JET CSIRT (https://jetcsirt.su/analytics/).
+Монитор новых статей The DFIR Report (https://thedfirreport.com/) —
+автономная выгрузка для GitHub.
 
-Сайт без RSS, контент отдаётся серверно (Битрикс).
+Проблема: из РФ сайт недоступен, поэтому статьи с <base href> открывались
+«голыми» (картинки и стили не грузились). Решение:
+  1. Картинки скачиваются на этапе крона и сохраняются в папку
+     <статья>_assets/ рядом с HTML; пути в HTML переписываются на локальные.
+  2. Стили <link rel="stylesheet"> инлайнятся в <style>.
+  3. <base> больше НЕ вставляется (ломал относительные пути картинок),
+     <script> вырезается.
+  4. Всё это — внутри GitHub Actions, где thedfirreport.com доступен,
+     поэтому репозиторий становится самодостаточным и открывается из РФ.
 
-Структура:
-  - каталог : div.news-cards__item -> a[href] h3.news-title (+ p.news-subtitle);
-    пагинация ?PAGEN_1=N (берём из .load-more[data-url] / навигации);
-  - отчёт   : h1.page-main-heading, дата .tags-wrapper .date (DD.MM.YYYY),
-    тело .post-content, внутри ссылка «Смотреть отчет» на .pdf.
-
-Что делает:
-  - обходит страницы каталога, останавливается на уже обработанных записях;
-  - для каждого нового отчёта создаёт ОТДЕЛЬНУЮ ПАПКУ:
-      index.html  - читабельная версия (заголовок, дата, тело, стили);
-      assets/     - картинки из статьи (хэш-имена, пути переписаны локально);
-      report-<hash>.pdf - скачанный PDF, ссылка в HTML ведёт на локальный файл;
-  - дедупликация в SQLite; упавшие записи не помечаются обработанными.
+Фиксы, сохранённые из прошлой версии:
+  - лента качается НАШИМ requests.Session (не голым feedparser);
+  - VERIFY_SSL = False (корпоративный TLS-перехват);
+  - нескачанные статьи НЕ помечаются обработанными.
 """
 
 import hashlib
-import html as html_module
-import json
 import logging
 import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
+import feedparser
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 
 # ------------------------------------------------------- настройки
-SITE_URL = "https://jetcsirt.su/analytics/"
-ROOT_DIR = Path("jetcsirt_analytics")      # внутри - папка на каждый отчёт
-DB_PATH  = Path("seen_jetcsirt.db")
+FEED_URL = "https://thedfirreport.com/feed/"
+OUT_DIR  = Path("thedfirreport/dfir_reports")
+DB_PATH  = Path("thedfirreport/seen_dfir.db")
 
+# False - НЕ проверять TLS: корпоративный прокси/Zscaler подменяет сертификаты.
 VERIFY_SSL = False
 
+# True = вырезать <script> из сохранённого HTML.
+STRIP_SCRIPTS = True
+
+# True = скачивать картинки в локальную папку и переписывать пути.
+DOWNLOAD_IMAGES = True
+
+# True = скачивать CSS и встраивать в <style> (офлайн-стилизация).
+INLINE_STYLES = True
+
+# ВАЖНО: только ASCII! Русский текст в HTTP-заголовках запрещён стандартом.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 AnalyticsMonitor/1.0"
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 DfirMonitor/2.0"
 )
 
 EXTRA_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Referer": "https://jetcsirt.su/",
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    "Referer": "https://thedfirreport.com/",
 }
 
 TIMEOUT = 30
 RETRIES = 2
 REQUEST_DELAY = 1.0
-MAX_PAGES = 10
 
-DOWNLOAD_IMAGES = True   # качать картинки статьи в assets/
-DOWNLOAD_PDF = True      # качать PDF «Смотреть отчет»
-
-# расширения, считающиеся «картинкой»
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".bmp"}
+# в каком порядке выбираем реальный src у картинок WP (srcset/lazy-атрибуты режем)
+IMAGE_SRC_ATTRS = ("data-src", "src", "data-lazy-src", "data-orig-file")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,22 +79,6 @@ log = logging.getLogger("monitor")
 
 if VERIFY_SSL is False:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-READER_CSS = """
-    body { font-family: 'Segoe UI', Arial, sans-serif; color: #1f2328;
-           line-height: 1.6; margin: 0; background: #fff; }
-    .reader-wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
-    h1 { font-size: 30px; line-height: 1.25; margin: 8px 0 4px; }
-    .meta { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
-    h2, h3 { margin: 24px 0 10px; }
-    p { margin: 14px 0; }
-    img { max-width: 100%; height: auto; border-radius: 8px; display: block; margin: 12px 0; }
-    a { color: #163BFF; }
-    ul, ol { padding-left: 22px; }
-    .btn-white-outline.big { display: inline-block; margin: 8px 0 16px;
-        padding: 10px 22px; border: 1px solid #163BFF; border-radius: 8px;
-        color: #163BFF; text-decoration: none; font-weight: 500; }
-"""
 
 
 # ------------------------------------------------------- хранилище
@@ -100,9 +91,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             url        TEXT NOT NULL,
             title      TEXT,
             published  TEXT,
-            folder_path TEXT,
-            index_path  TEXT,
-            pdf_names   TEXT,
+            file_path  TEXT,
             first_seen TEXT DEFAULT (datetime('now'))
         )
         """
@@ -116,14 +105,11 @@ def is_seen(conn: sqlite3.Connection, guid: str) -> bool:
     return cur.fetchone() is not None
 
 
-def mark_seen(conn: sqlite3.Connection, guid, url, title, published,
-              folder_path, index_path, pdf_names) -> None:
+def mark_seen(conn: sqlite3.Connection, guid, url, title, published, file_path) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO reports "
-        "(guid, url, title, published, folder_path, index_path, pdf_names) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (guid, url, title, published, folder_path, index_path,
-         json.dumps(pdf_names or [], ensure_ascii=False)),
+        "INSERT OR IGNORE INTO reports (guid, url, title, published, file_path) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (guid, url, title, published, str(file_path)),
     )
     conn.commit()
 
@@ -138,17 +124,20 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def clean_text(text: str) -> str:
-    text = html_module.unescape(text or "")
-    text = text.replace("\xa0", " ").replace("\u2011", "-")
-    return re.sub(r"\s+", " ", text).strip()
+def entry_guid(entry) -> str:
+    for key in ("id", "guid"):
+        val = entry.get(key)
+        if val:
+            return str(val)
+    return normalize_url(entry.get("link", "")) or entry.get("title", "")
 
 
 def make_stem(url: str) -> str:
+    """'.../some-report' -> 'some-report-1a2b3c4d'."""
     slug = url.rstrip("/").split("/")[-1]
     slug = re.sub(r"[^\w\-]+", "_", slug, flags=re.UNICODE)
     if not slug:
-        slug = "reports"
+        slug = "report"
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
     return f"{slug}-{digest}"
 
@@ -160,30 +149,13 @@ def origin_of(url: str) -> str | None:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def parse_date(text: str) -> str | None:
-    """'01.04.2026' -> '2026-04-01'."""
-    m = re.fullmatch(r"\s*(\d{2})\.(\d{2})\.(\d{4})\s*", text or "")
-    if not m:
-        return None
-    d, mo, y = m.groups()
-    return f"{y}-{mo}-{d}"
-
-
-def safe_url(url: str) -> str:
-    """Квотит не-ASCII символы (кириллица в /upload/...) для запроса."""
-    return requests.utils.requote_uri(url)
-
-
-def download_file(session, url: str, dest: Path) -> bool:
-    resp = session.get(safe_url(url), timeout=TIMEOUT, verify=VERIFY_SSL)
-    resp.raise_for_status()
-    dest.write_bytes(resp.content)
-    return True
-
-
-def ext_of(url: str) -> str:
+def guess_ext(url: str) -> str:
+    """Расширение файла по URL, иначе .bin."""
     path = urlparse(url).path.lower()
-    m = re.search(r"(\.[a-z0-9]{2,5})$", path)
+    m = re.search(
+        r"\.(jpe?g|png|gif|webp|avif|svg|bmp|ico|pdf|woff2?|ttf|otf|eot)$",
+        path,
+    )
     return m.group(1) if m else ".bin"
 
 
@@ -192,259 +164,184 @@ def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.headers.update(EXTRA_HEADERS)
+
     adapter = requests.adapters.HTTPAdapter(max_retries=RETRIES)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
 
-def fetch(session: requests.Session, url: str) -> requests.Response:
-    resp = session.get(safe_url(url), timeout=TIMEOUT, verify=VERIFY_SSL)
+def fetch_feed(session: requests.Session, url: str) -> bytes:
+    resp = session.get(url, timeout=TIMEOUT, verify=VERIFY_SSL)
     resp.raise_for_status()
-    return resp
+    return resp.content
 
 
-# ------------------------------------------------------- каталог
-def parse_catalog(html: str, base_url: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    seen_urls = set()
-    for card in soup.select(".news-cards__item"):
-        a = card.select_one("a[href] h3") or card.select_one("h3 a[href]")
-        if a is None:
-            # страховка: если h3 обёрнут в <a>
-            a = card.find("a", href=True)
-        if a is None:
+# ------------------------------------------------------- assets
+def download_asset(session: requests.Session, url: str, dest_dir: Path) -> str:
+    """Качает файл, сохраняет в dest_dir. Возвращает имя файла."""
+    resp = session.get(url, timeout=TIMEOUT, verify=VERIFY_SSL)
+    resp.raise_for_status()
+
+    name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12] + guess_ext(url)
+    dest = dest_dir / name
+    if not dest.exists():
+        dest.write_bytes(resp.content)
+    return dest.name
+
+
+def process_images(session, soup: BeautifulSoup, base_url: str, assets_dir: Path) -> int:
+    """Скачивает картинки в assets_dir и переписывает src на локальные пути."""
+    count = 0
+    for img in soup.find_all("img"):
+        src = None
+        for attr in IMAGE_SRC_ATTRS:
+            if img.get(attr):
+                src = img[attr]
+                break
+        if not src:
             continue
 
-        href = a.get("href") or ""
-        if not href:
+        abs_url = urljoin(base_url, src)
+        try:
+            name = download_asset(session, abs_url, assets_dir)
+        except Exception as exc:
+            # не падаем из-за одной картинки — оставляем исходную ссылку
+            log.debug("  [asset] не скачалась %s: %s", abs_url, exc)
             continue
-        url = normalize_url(urljoin(base_url, href))
-        if url in seen_urls:
+
+        rel = f"{assets_dir.name}/{name}"
+        img["src"] = rel
+        # убираем srcset/lazy-атрибуты, чтобы ничего не ссылалось на сайт
+        for attr in list(img.attrs):
+            if "srcset" in attr or attr in ("data-src", "data-lazy-src", "data-orig-file"):
+                del img[attr]
+        count += 1
+    return count
+
+
+def inline_stylesheets(session, soup: BeautifulSoup, base_url: str) -> int:
+    """Инлайнит <link rel=stylesheet> в <style> (для офлайн-стилизации)."""
+    count = 0
+    for link in soup.find_all("link", href=True):
+        rel = link.get("rel") or []
+        if "stylesheet" not in rel:
             continue
-        seen_urls.add(url)
-
-        h3 = card.select_one("h3.news-title")
-        title = h3.get_text(" ", strip=True) if h3 else clean_text(a.get_text(" ", strip=True))
-        sub = card.select_one("p.news-subtitle")
-        subtitle = sub.get_text(" ", strip=True) if sub else ""
-
-        items.append({"url": url, "title": title, "subtitle": subtitle})
-    return items
-
-
-def next_page_url(html: str, base_url: str) -> str | None:
-    """URL следующей страницы пагинации (?PAGEN_1=N), если есть."""
-    soup = BeautifulSoup(html, "html.parser")
-    lm = soup.select_one(".load-more[data-url]")
-    if lm is not None and lm.get("data-url"):
-        return urljoin(base_url, lm["data-url"])
-    # запасной вариант: стрелка вперёд / ссылка на вторую страницу
-    for a in soup.select("a[href*='PAGEN_1=']"):
-        href = urljoin(base_url, a["href"])
-        qs = urlparse(href).query
-        if re.search(r"PAGEN_1=(\d+)", qs):
-            page = int(re.search(r"PAGEN_1=(\d+)", qs).group(1))
-            if page > 1:
-                return href
-    return None
+        href = link["href"]
+        if not href.startswith(("http://", "https://")):
+            href = urljoin(base_url, href)
+        try:
+            resp = session.get(href, timeout=TIMEOUT, verify=VERIFY_SSL)
+            resp.raise_for_status()
+            css = resp.content.decode("utf-8", errors="replace")
+        except Exception as exc:
+            log.debug("  [css] не скачался %s: %s", href, exc)
+            continue
+        style = soup.new_tag("style")
+        style.string = css
+        link.replace_with(style)
+        count += 1
+    return count
 
 
-# ------------------------------------------------------- отчёт + ассеты
-def strip_vue_attrs(soup: BeautifulSoup) -> None:
-    for tag in soup.find_all(True):
-        for key in list(tag.attrs.keys()):
-            if key.startswith("v-") or key.startswith(":") or key.startswith("@"):
-                del tag.attrs[key]
-    for tag in soup.find_all(attrs={"hidden": True}):
-        del tag.attrs["hidden"]
+# ------------------------------------------------------- скачивание отчёта
+def download_report(session: requests.Session, url: str, out_dir: Path) -> Path:
+    resp = session.get(url, timeout=TIMEOUT, verify=VERIFY_SSL)
+    resp.raise_for_status()
 
-
-def download_report(session, url: str, root_dir: Path):
-    """
-    Качает страницу отчёта, собирает папку со всеми ассетами.
-    Возвращает (folder_path, index_path, pdf_names).
-    """
-    resp = fetch(session, url)
-    final_url = resp.url
+    final_url = resp.url  # реальный адрес после редиректов
     soup = BeautifulSoup(resp.content.decode("utf-8", errors="replace"), "html.parser")
 
-    # заголовок
-    title = None
-    h1 = soup.select_one("h1.page-main-heading") or soup.select_one("h1")
-    if h1 is not None:
-        title = clean_text(h1.get_text(" ", strip=True))
-
-    # дата
-    date = None
-    date_el = soup.select_one(".tags-wrapper .date")
-    if date_el is not None:
-        date = parse_date(date_el.get_text(" ", strip=True))
-
-    # тело
-    body_el = soup.select_one(".post-content")
-    if body_el is None:
-        raise RuntimeError("Не найден блок .post-content")
-
-    # --------------------------------------------------------- папка отчёта
     stem = make_stem(final_url)
-    folder = root_dir / stem
-    assets_dir = folder / "assets"
-    folder.mkdir(parents=True, exist_ok=True)
-    assets_dir.mkdir(exist_ok=True)
+    html_path = out_dir / f"{stem}.html"
+    assets_dir = out_dir / f"{stem}_assets"
 
-    pdf_names = []
-
-    # --- картинки в assets/ ---
     if DOWNLOAD_IMAGES:
-        for img in body_el.find_all("img"):
-            src = img.get("src")
-            if not src:
-                continue
-            abs_url = urljoin(final_url, src)
-            ext = ext_of(abs_url)
-            if ext not in IMAGE_EXTS:
-                continue
-            name = hashlib.sha256(abs_url.encode("utf-8")).hexdigest()[:12] + ext
-            dest = assets_dir / name
-            try:
-                download_file(session, abs_url, dest)
-            except Exception as exc:
-                log.debug("  [img] не скачалась %s: %s", abs_url, exc)
-                continue
-            img["src"] = f"assets/{name}"
-            # убираем srcset/lazy-атрибуты, чтобы не тянули оригинал
-            for attr in list(img.attrs):
-                if "srcset" in attr or attr in ("data-src", "data-lazy-src"):
-                    del img[attr]
+        assets_dir.mkdir(exist_ok=True)
+        imgs = process_images(session, soup, final_url, assets_dir)
+        if imgs:
+            log.info("  %s: картинок привязано: %d", stem, imgs)
 
-    # --- PDF-ссылки («Смотреть отчет») ---
-    if DOWNLOAD_PDF:
-        for a in body_el.find_all("a", href=True):
-            href = a["href"]
-            abs_url = urljoin(final_url, href)
-            if ext_of(abs_url).lower() != ".pdf":
-                continue
-            name = f"report-{hashlib.sha256(abs_url.encode('utf-8')).hexdigest()[:8]}.pdf"
-            dest = folder / name
-            try:
-                download_file(session, abs_url, dest)
-            except Exception as exc:
-                log.debug("  [pdf] не скачался %s: %s", abs_url, exc)
-                continue
-            a["href"] = name          # локальная ссылка в той же папке
-            a["target"] = "_self"
-            pdf_names.append(name)
+    if INLINE_STYLES:
+        css = inline_stylesheets(session, soup, final_url)
+        if css:
+            log.info("  %s: стилей инлайн: %d", stem, css)
 
-    # убираем лишнее
-    strip_vue_attrs(body_el)
+    # локальные картинки ломает <base> -> удаляем его, если он есть
+    for b in soup.find_all("base"):
+        b.decompose()
 
-    # --------------------------------------------------------- HTML
-    meta = []
-    if date:
-        meta.append(f"Дата: {date}")
-    meta.append(f"Источник: {final_url}")
-    if pdf_names:
-        meta.append(f"PDF: {'; '.join(pdf_names)}")
+    if STRIP_SCRIPTS:
+        for s in soup.find_all("script"):
+            s.decompose()
 
-    page = (
-        "<!DOCTYPE html>\n<html lang=\"ru\">\n<head>\n"
-        f"<meta charset=\"utf-8\">\n"
-        f"<title>{html_module.escape(title or 'Отчет')}</title>\n"
-        f"<style>{READER_CSS}</style>\n"
-        "</head>\n<body>\n<div class=\"reader-wrap\">\n"
-        + "<h1>" + (html_module.escape(title) if title else "Без заголовка") + "</h1>\n"
-        + ("<div class=\"meta\">" + " · ".join(meta) + "</div>\n" if meta else "")
-        + str(body_el)
-        + "\n</div>\n</body>\n</html>"
-    )
+    # убираем пустую папку assets, если не привязали ни одной картинки
+    if DOWNLOAD_IMAGES:
+        try:
+            assets_dir.rmdir()
+        except OSError:
+            pass
 
-    index_path = folder / "index.html"
-    index_path.write_text(page, encoding="utf-8")
-
-    # если папка assets пустая — удаляем
-    try:
-        assets_dir.rmdir()
-    except OSError:
-        pass
-
-    return folder, index_path, pdf_names
+    html_path.write_text(str(soup), encoding="utf-8")
+    return html_path
 
 
 # ------------------------------------------------------- основной цикл
 def main() -> int:
-    ROOT_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(exist_ok=True)
     conn = init_db(DB_PATH)
     session = make_session()
 
-    items = []                # все новые кандидаты со всех страниц каталога
-    seen_this_run: set[str] = set()
-    page_url = SITE_URL
+    log.info("Загружаю ленту: %s", FEED_URL)
+    try:
+        xml = fetch_feed(session, FEED_URL)
+    except Exception as exc:
+        log.error("Не удалось получить ленту %s: %s", FEED_URL, exc)
+        conn.close()
+        return 1
 
-    for _page in range(1, MAX_PAGES + 1):
-        log.info("Каталог, страница %d: %s", _page, page_url)
-        try:
-            html = fetch(session, page_url).content.decode("utf-8", errors="replace")
-        except Exception as exc:
-            log.error("Ошибка загрузки каталога %s: %s", page_url, exc)
-            break
-
-        page_items = parse_catalog(html, page_url)
-        if not page_items:
-            break
-
-        hit_processed = False
-        for it in page_items:
-            if it["url"] in seen_this_run:
-                continue
-            seen_this_run.add(it["url"])
-            items.append(it)
-            if is_seen(conn, it["url"]):
-                hit_processed = True
-
-        if hit_processed:
-            log.info("Дошли до уже обработанных записей — останавливаемся.")
-            break
-
-        nxt = next_page_url(html, page_url)
-        if not nxt or normalize_url(nxt) == normalize_url(page_url):
-            break
-        page_url = nxt
-        time.sleep(REQUEST_DELAY)
-
-    log.info("В каталоге новых кандидатов: %d", len(items))
+    feed = feedparser.parse(xml)
+    if not feed.entries:
+        log.error("Лента пуста или не распарсилась: %s",
+                  getattr(feed, "bozo_exception", "нет данных"))
+        conn.close()
+        return 1
 
     new_found = 0
-    ok = 0
+    downloaded = 0
     failed = 0
+    seen_this_run: set[str] = set()
 
-    for item in items:
-        guid = item["url"]
-        if is_seen(conn, guid):
+    for entry in feed.entries:
+        guid = entry_guid(entry)
+        url = normalize_url(entry.get("link", ""))
+
+        if guid in seen_this_run or is_seen(conn, guid):
             continue
+        seen_this_run.add(guid)
         new_found += 1
 
-        log.info("[НОВАЯ] %s | %s", item["title"], item["url"])
+        title = entry.get("title", "")
+        published = None
+        if entry.get("published_parsed"):
+            published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
+
+        log.info("[НОВАЯ] %s | %s", title, url)
         try:
-            folder, index_path, pdf_names = download_report(session, item["url"], ROOT_DIR)
+            path = download_report(session, url, OUT_DIR)
         except Exception as exc:
-            log.error("Ошибка обработки %s: %s", item["url"], exc)
+            # НЕ помечаем как обработанную: в следующий прогон попробуем снова
+            log.error("Ошибка скачивания %s: %s", url, exc)
             failed += 1
             continue
 
-        mark_seen(conn, guid, item["url"], item["title"], item.get("subtitle"),
-                  str(folder), str(index_path), pdf_names)
-        ok += 1
-        if pdf_names:
-            log.info("  -> %s (+ PDF: %s)", index_path.name, ", ".join(pdf_names))
-        else:
-            log.info("  -> %s", index_path.name)
+        mark_seen(conn, guid, url, title, published, path)
+        downloaded += 1
 
         time.sleep(REQUEST_DELAY)
 
-    log.info("Готово. Новых: %d, обработано: %d, ошибок: %d. Папки в: %s",
-             new_found, ok, failed, ROOT_DIR)
+    log.info("Готово. Новых в ленте: %d, скачано: %d, ошибок: %d. Файлы в: %s",
+             new_found, downloaded, failed, OUT_DIR)
     conn.close()
     return 0
 
