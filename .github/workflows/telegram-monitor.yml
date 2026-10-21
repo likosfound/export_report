@@ -1,0 +1,39 @@
+name: telegram-binzone-monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'     # каждые 10 минут (как у dfir-monitor)
+  workflow_dispatch:           # ручной запуск из вкладки Actions
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+      TG_SCAN_LIMIT: 20        # последние 20 сообщений (совпадает с дефолтом в скрипте)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run telegram monitor
+        run: python telegram/monitor_telegram_bizone.py
+
+      - name: Commit and push results
+        run: |
+          git config user.name "reports-bot"
+          git config user.email "reports-bot@users.noreply.github.com"
+          git add telegram/
+          git diff --quiet && git diff --cached --quiet || git commit -m "update telegram reports"
+          git push
