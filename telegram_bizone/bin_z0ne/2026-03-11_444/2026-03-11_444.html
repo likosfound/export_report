@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>🤔 **Детектируем TLS-туннели без расшифровки**</title>
+<style>
+  body { max-width: 860px; margin: 24px auto; padding: 0 16px;
+         font-family: Arial, sans-serif; line-height: 1.55; }
+  .meta { color: #666; font-size: 13px; }
+  p { overflow-wrap: anywhere; }
+  img { border: 1px solid #ddd; border-radius: 6px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>@bin_z0ne</h1>
+<p class="meta">Дата: 2026-03-11 08:33:56 UTC · ID: 444 ·
+<a href="https://t.me/bin_z0ne/444" target="_blank">открыть оригинал</a></p>
+<hr>
+<p>🤔 **Детектируем TLS-туннели без расшифровки**</p>
+<p>TLS давно стал идеальным укрытием: снаружи мы видим лишь безобидный шифрованный поток, а внутри вполне может жить полноценный C2-туннель. Мы уже [показывали](https://bi.zone/ru/expertise/blog/zloumyshlenniki-ekspluatiruyut-uyazvimost-cve-2025-55182-v-atakakh-na-rossiyskie-kompanii/), что Sliver встречается в реальных цепочках атак. Ниже — разбор, как детектировать такие невидимые TLS-туннели без расшифровки.</p>
+<p>Начиная с версии Sliver 1.7.0 в mTLS-транспорте используется Yamux — легкий протокол мультиплексирования, который позволяет гонять несколько логических потоков поверх одного TCP-/TLS-соединения. Yamux добавляет служебные кадры и предсказуемую «структуру» обмена, и в связке с сообщениями Sliver это дает хороший материал для сигнатур.</p>
+<p>**Порядок сообщений (клиент → сервер) после установки TLS-сессии**</p>
+<p>**1️⃣****Yamux preface**: MUX/1 — длина TLS Application Data record (ciphertext): **22**.</p>
+<p>2️⃣**Yamux frame header**: WINDOW_UPDATE — длина TLS Application Data record (ciphertext): **29**.</p>
+<p>3️⃣**Yamux frame header**: DATA — длина TLS Application Data record (ciphertext): **29**.</p>
+<p>4️⃣**DATA payload**: RawSig (EdDSA + keyID публичного ключа подписи + ed25519 signature) — длина TLS Application Data record (ciphertext): **91**.</p>
+<p>5️⃣**Yamux frame header**: DATA — длина TLS Application Data record (ciphertext): **29**.</p>
+<p>6️⃣**DATA payload**: uint32 LE длина следующего protobuf-Envelope — длина TLS Application Data record (ciphertext): **21**.</p>
+<p>7️⃣**Yamux frame header**: DATA — длина TLS Application Data record (ciphertext): **29**.</p>
+<p>8️⃣**DATA payload**: protobuf Envelope (MsgRegister) → Register{ метаданные хоста/процесса и активного C2 } — длина TLS Application Data record (ciphertext): **переменный** (часто в диапазоне сотен байт).</p>
+<p>После первичной регистрации имплант раз в 2 минуты отправляет keepalive-ping для проверки доступности C2. Типичная «форма» ping по длинам TLS Application Data record (ciphertext): **21 → 29 → 25** (повторяется несколько раз).</p>
+<p>**Общая логика сигнатуры**</p>
+<p>1️⃣Поймать init-цепочку TLS records с длинами ciphertext:</p>
+<p>   **22 → 29 → 29 → 91 → 29 → 21 → 29 → (200–600)**</p>
+<p>2️⃣Затем подтвердить сессию несколькими ping-последовательностями:</p>
+<p>   **21 → 29 → 25** (2–3 раза в пределах окна времени)</p>
+<p>Даже без расшифровки TLS Sliver остается заметным: mTLS-сессии с Yamux дают стабильную сигнатуру по последовательности размеров TLS records и характерным ping-пакетам. Корреляция init-цепочки и периодических ping позволяет уверенно атрибутировать C2-трафик и снизить число ложных срабатываний.</p>
+</body>
+</html>
