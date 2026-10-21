@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Монитор новых статей The DFIR Report (https://thedfirreport.com/).
+Монитор новых статей The DFIR Report (https://thedfirreport.com/) —
+автономная выгрузка для GitHub.
 
-У сайта есть RSS: https://thedfirreport.com/feed/ - используем его.
+Проблема: из РФ сайт недоступен, поэтому статьи с <base href> открывались
+«голыми» (картинки и стили не грузились). Решение:
+  1. Картинки скачиваются на этапе крона и сохраняются в папку
+     <статья>_assets/ рядом с HTML; пути в HTML переписываются на локальные.
+  2. Стили <link rel="stylesheet"> инлайнятся в <style>.
+  3. <base> больше НЕ вставляется (ломал относительные пути картинок),
+     <script> вырезается.
+  4. Всё это — внутри GitHub Actions, где thedfirreport.com доступен,
+     поэтому репозиторий становится самодостаточным и открывается из РФ.
 
-Особенности этой версии:
-  1. Лента качается НАШИМ requests.Session (UA, VERIFY_SSL, retry),
-     а не внутренним запросом feedparser - иначе в корпоративном
-     прокси/Zscaler лента отдаётся пустой.
-  2. Статьи (WordPress, серверный HTML) сохраняются с тегом <base> и без
-     <script> - открываются с диска с картинками и разметкой.
-  3. VERIFY_SSL = False из-за корпоративного TLS-перехвата.
-  4. Нескачанные статьи НЕ помечаются обработанными -> перезапуск докачает.
+Фиксы, сохранённые из прошлой версии:
+  - лента качается НАШИМ requests.Session (не голым feedparser);
+  - VERIFY_SSL = False (корпоративный TLS-перехват);
+  - нескачанные статьи НЕ помечаются обработанными.
 """
 
 import hashlib
@@ -22,7 +27,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -37,17 +42,23 @@ DB_PATH  = Path("thedfirreport/seen_dfir.db")
 # False - НЕ проверять TLS: корпоративный прокси/Zscaler подменяет сертификаты.
 VERIFY_SSL = False
 
-# True = вырезать <script> и добавить <base>, чтобы файл открывался с диска.
+# True = вырезать <script> из сохранённого HTML.
 STRIP_SCRIPTS = True
+
+# True = скачивать картинки в локальную папку и переписывать пути.
+DOWNLOAD_IMAGES = True
+
+# True = скачивать CSS и встраивать в <style> (офлайн-стилизация).
+INLINE_STYLES = True
 
 # ВАЖНО: только ASCII! Русский текст в HTTP-заголовках запрещён стандартом.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 DfirMonitor/1.0"
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 DfirMonitor/2.0"
 )
 
 EXTRA_HEADERS = {
-    "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
     "Referer": "https://thedfirreport.com/",
 }
@@ -55,6 +66,9 @@ EXTRA_HEADERS = {
 TIMEOUT = 30
 RETRIES = 2
 REQUEST_DELAY = 1.0
+
+# в каком порядке выбираем реальный src у картинок WP (srcset/lazy-атрибуты режем)
+IMAGE_SRC_ATTRS = ("data-src", "src", "data-lazy-src", "data-orig-file")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,13 +132,14 @@ def entry_guid(entry) -> str:
     return normalize_url(entry.get("link", "")) or entry.get("title", "")
 
 
-def make_filename(url: str) -> str:
+def make_stem(url: str) -> str:
+    """'.../some-report' -> 'some-report-1a2b3c4d'."""
     slug = url.rstrip("/").split("/")[-1]
     slug = re.sub(r"[^\w\-]+", "_", slug, flags=re.UNICODE)
     if not slug:
         slug = "report"
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
-    return f"{slug}-{digest}.html"
+    return f"{slug}-{digest}"
 
 
 def origin_of(url: str) -> str | None:
@@ -134,35 +149,14 @@ def origin_of(url: str) -> str | None:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-# ------------------------------------------------------- подготовка HTML
-def strip_scripts(html: str) -> str:
-    html = re.sub(r"<script\b[^>]*/>", "", html, flags=re.IGNORECASE)
-    html = re.sub(
-        r"<script\b[^>]*>.*?</script>",
-        "",
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
+def guess_ext(url: str) -> str:
+    """Расширение файла по URL, иначе .bin."""
+    path = urlparse(url).path.lower()
+    m = re.search(
+        r"\.(jpe?g|png|gif|webp|avif|svg|bmp|ico|pdf|woff2?|ttf|otf|eot)$",
+        path,
     )
-    return html
-
-
-def prepare_html(html_bytes: bytes, url: str, strip: bool) -> bytes:
-    origin = origin_of(url)
-    text = html_bytes.decode("utf-8", errors="replace")
-
-    if origin is not None and "<base" not in text.lower():
-        base_tag = f'<base href="{origin}/">'
-        head = re.search(r"<head[^>]*>", text, re.I)
-        if head:
-            pos = head.end()
-            text = text[:pos] + base_tag + text[pos:]
-        else:
-            text = base_tag + text
-
-    if strip:
-        text = strip_scripts(text)
-
-    return text.encode("utf-8")
+    return m.group(1) if m else ".bin"
 
 
 # ------------------------------------------------------- сеть
@@ -183,16 +177,113 @@ def fetch_feed(session: requests.Session, url: str) -> bytes:
     return resp.content
 
 
+# ------------------------------------------------------- assets
+def download_asset(session: requests.Session, url: str, dest_dir: Path) -> str:
+    """Качает файл, сохраняет в dest_dir. Возвращает имя файла."""
+    resp = session.get(url, timeout=TIMEOUT, verify=VERIFY_SSL)
+    resp.raise_for_status()
+
+    name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12] + guess_ext(url)
+    dest = dest_dir / name
+    if not dest.exists():
+        dest.write_bytes(resp.content)
+    return dest.name
+
+
+def process_images(session, soup: BeautifulSoup, base_url: str, assets_dir: Path) -> int:
+    """Скачивает картинки в assets_dir и переписывает src на локальные пути."""
+    count = 0
+    for img in soup.find_all("img"):
+        src = None
+        for attr in IMAGE_SRC_ATTRS:
+            if img.get(attr):
+                src = img[attr]
+                break
+        if not src:
+            continue
+
+        abs_url = urljoin(base_url, src)
+        try:
+            name = download_asset(session, abs_url, assets_dir)
+        except Exception as exc:
+            # не падаем из-за одной картинки — оставляем исходную ссылку
+            log.debug("  [asset] не скачалась %s: %s", abs_url, exc)
+            continue
+
+        rel = f"{assets_dir.name}/{name}"
+        img["src"] = rel
+        # убираем srcset/lazy-атрибуты, чтобы ничего не ссылалось на сайт
+        for attr in list(img.attrs):
+            if "srcset" in attr or attr in ("data-src", "data-lazy-src", "data-orig-file"):
+                del img[attr]
+        count += 1
+    return count
+
+
+def inline_stylesheets(session, soup: BeautifulSoup, base_url: str) -> int:
+    """Инлайнит <link rel=stylesheet> в <style> (для офлайн-стилизации)."""
+    count = 0
+    for link in soup.find_all("link", href=True):
+        rel = link.get("rel") or []
+        if "stylesheet" not in rel:
+            continue
+        href = link["href"]
+        if not href.startswith(("http://", "https://")):
+            href = urljoin(base_url, href)
+        try:
+            resp = session.get(href, timeout=TIMEOUT, verify=VERIFY_SSL)
+            resp.raise_for_status()
+            css = resp.content.decode("utf-8", errors="replace")
+        except Exception as exc:
+            log.debug("  [css] не скачался %s: %s", href, exc)
+            continue
+        style = soup.new_tag("style")
+        style.string = css
+        link.replace_with(style)
+        count += 1
+    return count
+
+
+# ------------------------------------------------------- скачивание отчёта
 def download_report(session: requests.Session, url: str, out_dir: Path) -> Path:
     resp = session.get(url, timeout=TIMEOUT, verify=VERIFY_SSL)
     resp.raise_for_status()
 
     final_url = resp.url  # реальный адрес после редиректов
-    html = prepare_html(resp.content, final_url, STRIP_SCRIPTS)
+    soup = BeautifulSoup(resp.content.decode("utf-8", errors="replace"), "html.parser")
 
-    out_path = out_dir / make_filename(final_url)
-    out_path.write_bytes(html)
-    return out_path
+    stem = make_stem(final_url)
+    html_path = out_dir / f"{stem}.html"
+    assets_dir = out_dir / f"{stem}_assets"
+
+    if DOWNLOAD_IMAGES:
+        assets_dir.mkdir(exist_ok=True)
+        imgs = process_images(session, soup, final_url, assets_dir)
+        if imgs:
+            log.info("  %s: картинок привязано: %d", stem, imgs)
+
+    if INLINE_STYLES:
+        css = inline_stylesheets(session, soup, final_url)
+        if css:
+            log.info("  %s: стилей инлайн: %d", stem, css)
+
+    # локальные картинки ломает <base> -> удаляем его, если он есть
+    for b in soup.find_all("base"):
+        b.decompose()
+
+    if STRIP_SCRIPTS:
+        for s in soup.find_all("script"):
+            s.decompose()
+
+    # убираем пустую папку assets, если не привязали ни одной картинки
+    if DOWNLOAD_IMAGES:
+        try:
+            assets_dir.rmdir()
+        except OSError:
+            pass
+
+    html_path.write_text(str(soup), encoding="utf-8")
+    return html_path
 
 
 # ------------------------------------------------------- основной цикл
