@@ -5,13 +5,22 @@
 
 Проблема: из РФ сайт недоступен, поэтому статьи с <base href> открывались
 «голыми» (картинки и стили не грузились). Решение:
-  1. Картинки скачиваются на этапе крона и сохраняются в папку
-     <статья>_assets/ рядом с HTML; пути в HTML переписываются на локальные.
+  1. Картинки скачиваются на этапе крона и сохраняются в папку images/
+     внутри папки отчёта; пути в HTML переписываются на локальные.
   2. Стили <link rel="stylesheet"> инлайнятся в <style>.
   3. <base> больше НЕ вставляется (ломал относительные пути картинок),
      <script> вырезается.
   4. Всё это — внутри GitHub Actions, где thedfirreport.com доступен,
      поэтому репозиторий становится самодостаточным и открывается из РФ.
+
+Структура выгрузки:
+    thedfirreport/
+    ├── seen_dfir.db
+    └── <отчёт>-<хэш>/
+        ├── <отчёт>-<хэш>.html
+        └── images/
+            ├── <hash>.png
+            └── ...
 
 Фиксы, сохранённые из прошлой версии:
   - лента качается НАШИМ requests.Session (не голым feedparser);
@@ -36,7 +45,7 @@ from bs4 import BeautifulSoup
 
 # ------------------------------------------------------- настройки
 FEED_URL = "https://thedfirreport.com/feed/"
-OUT_DIR  = Path("thedfirreport/dfir_reports")
+OUT_DIR  = Path("thedfirreport")     # корень: в нём папки отчётов + БД
 DB_PATH  = Path("thedfirreport/seen_dfir.db")
 
 # False - НЕ проверять TLS: корпоративный прокси/Zscaler подменяет сертификаты.
@@ -253,8 +262,12 @@ def download_report(session: requests.Session, url: str, out_dir: Path) -> Path:
     soup = BeautifulSoup(resp.content.decode("utf-8", errors="replace"), "html.parser")
 
     stem = make_stem(final_url)
-    html_path = out_dir / f"{stem}.html"
-    assets_dir = out_dir / f"{stem}_assets"
+
+    # каждый отчёт — в свою подпапку, картинки — внутри неё в images/
+    report_dir = out_dir / stem
+    report_dir.mkdir(exist_ok=True)
+    html_path = report_dir / f"{stem}.html"
+    assets_dir = report_dir / "images"
 
     if DOWNLOAD_IMAGES:
         assets_dir.mkdir(exist_ok=True)
@@ -275,7 +288,7 @@ def download_report(session: requests.Session, url: str, out_dir: Path) -> Path:
         for s in soup.find_all("script"):
             s.decompose()
 
-    # убираем пустую папку assets, если не привязали ни одной картинки
+    # убираем пустую папку images, если не привязали ни одной картинки
     if DOWNLOAD_IMAGES:
         try:
             assets_dir.rmdir()
@@ -340,7 +353,7 @@ def main() -> int:
 
         time.sleep(REQUEST_DELAY)
 
-    log.info("Готово. Новых в ленте: %d, скачано: %d, ошибок: %d. Файлы в: %s",
+    log.info("Готово. Новых в ленте: %d, скачано: %d, ошибок: %d. Отчёты в: %s",
              new_found, downloaded, failed, OUT_DIR)
     conn.close()
     return 0
