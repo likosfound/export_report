@@ -374,7 +374,7 @@ def download_report(session, url: str, root_dir: Path):
 
 # ------------------------------------------------------- основной цикл
 def main() -> int:
-    ROOT_DIR.mkdir(exist_ok=True)
+    ROOT_DIR.mkdir(parents=True, exist_ok=True)
     conn = init_db(DB_PATH)
     session = make_session()
 
