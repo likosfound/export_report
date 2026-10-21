@@ -45,8 +45,8 @@ from bs4 import BeautifulSoup
 
 # ------------------------------------------------------- настройки
 FEED_URL = "https://thedfirreport.com/feed/"
-OUT_DIR  = Path("thedfirreport")     # корень: в нём папки отчётов + БД
-DB_PATH  = Path("thedfirreport/seen_dfir.db")
+OUT_DIR  = Path("thedfirreport/thedfirreport_articles")  
+DB_PATH  = Path("thedfirreport/seen_dfir.db")           
 
 # False - НЕ проверять TLS: корпоративный прокси/Zscaler подменяет сертификаты.
 VERIFY_SSL = False
